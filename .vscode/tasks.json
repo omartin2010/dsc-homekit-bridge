@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PlatformIO: Build",
+      "type": "shell",
+      "command": "${env:HOME}/.platformio/penv/bin/pio",
+      "args": ["run", "-e", "esp32dev"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "PlatformIO: Upload",
+      "type": "shell",
+      "command": "${env:HOME}/.platformio/penv/bin/pio",
+      "args": ["run", "-e", "esp32dev", "-t", "upload", "--upload-port", "/dev/cu.usbserial-0001"],
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "PlatformIO: Monitor",
+      "type": "shell",
+      "command": "${env:HOME}/.platformio/penv/bin/pio",
+      "args": ["device", "monitor", "--baud", "115200", "--port", "/dev/cu.usbserial-0001"],
+      "group": "test",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": [],
+      "isBackground": true
+    },
+    {
+      "label": "PlatformIO: Upload and Monitor",
+      "dependsOrder": "sequence",
+      "dependsOn": ["PlatformIO: Upload", "PlatformIO: Monitor"],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

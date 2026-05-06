@@ -1,0 +1,6 @@
+[submodule "lib/dscKeybusInterface"]
+	path = lib/dscKeybusInterface
+	url = https://github.com/taligentx/dscKeybusInterface.git
+[submodule "lib/HomeSpan"]
+	path = lib/HomeSpan
+	url = https://github.com/HomeSpan/HomeSpan.git
