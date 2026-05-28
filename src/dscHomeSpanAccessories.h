@@ -40,7 +40,7 @@ struct dscPartition : Service::SecuritySystem {
   // Handles requests received from HomeKit
   boolean update() {
     byte targetState = partitionTargetState->getNewVal();
-    
+
     // Sets night arm (no entry delay) while armed
     if (targetState == HOMEKIT_NIGHT && dsc.armed[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -48,7 +48,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'N';
       return(true);
     }
-  
+
     // Disables night arm while armed stay
     if (targetState == HOMEKIT_STAY && dsc.armedStay[partition] && dsc.noEntryDelay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -56,7 +56,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'S';
       return(true);
     }
-  
+
     // Disables night arm while armed away
     if (targetState == HOMEKIT_AWAY && dsc.armedAway[partition] && dsc.noEntryDelay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -64,7 +64,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'A';
       return(true);
     }
-  
+
     // Changes from arm away to arm stay after the exit delay
     if (targetState == HOMEKIT_STAY && dsc.armedAway[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -72,7 +72,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'S';
       return(true);
     }
-  
+
     // Changes from arm stay to arm away after the exit delay
     if (targetState == HOMEKIT_AWAY && dsc.armedStay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -80,21 +80,21 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'A';
       return(true);
     }
-  
+
     // Resets the HomeKit target state if attempting to change the armed mode while not ready
     if (targetState != HOMEKIT_DISARM && !dsc.ready[partition]) {
       dsc.armedChanged[partition] = true;
       dsc.statusChanged = true;
       return(true);
     }
-  
+
     // Resets the HomeKit target state if attempting to change the arming mode during the exit delay
     if (targetState != HOMEKIT_DISARM && dsc.exitDelay[partition] && exitState != 0) {
       if (exitState == 'S') partitionTargetState->setVal(HOMEKIT_STAY);
       else if (exitState == 'A') partitionTargetState->setVal(HOMEKIT_AWAY);
       else if (exitState == 'N') partitionTargetState->setVal(HOMEKIT_NIGHT);
     }
-  
+
     // Stay arm
     if (targetState == HOMEKIT_STAY && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -102,7 +102,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'S';
       return(true);
     }
-  
+
     // Away arm
     if (targetState == HOMEKIT_AWAY && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -110,7 +110,7 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'A';
       return(true);
     }
-  
+
     // Night arm
     if (targetState == HOMEKIT_NIGHT && !dsc.armed[partition] && !dsc.exitDelay[partition]) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
@@ -118,14 +118,14 @@ struct dscPartition : Service::SecuritySystem {
       exitState = 'N';
       return(true);
     }
-  
+
     // Disarm
     if (targetState == HOMEKIT_DISARM && (dsc.armed[partition] || dsc.exitDelay[partition] || dsc.alarm[partition])) {
       dsc.writePartition = partition + 1;    // Sets writes to the partition number
       dsc.write(accessCode);
       return(true);
     }
-    
+
     return(true);
   }
 
@@ -134,7 +134,7 @@ struct dscPartition : Service::SecuritySystem {
   void loop() {
     if (updatePartitions) {
       updatePartitions = false;
-      
+
       if (dsc.armedChanged[partition]) {
         if (dsc.armed[partition]) {
           exitState = 0;
@@ -160,11 +160,11 @@ struct dscPartition : Service::SecuritySystem {
           partitionCurrentState->setVal(HOMEKIT_DISARM);
         }
       }
-      
+
       // Updates exit delay status
       if (dsc.exitDelayChanged[partition]) {
         dsc.exitDelayChanged[partition] = false;  // Resets the exit delay status flag
-        
+
         if (dsc.exitDelay[partition]) {
 
           // Sets the arming target state if the panel is armed externally
@@ -209,15 +209,15 @@ struct dscPartition : Service::SecuritySystem {
           partitionCurrentState->setVal(HOMEKIT_DISARM);
         }
       }
-      
+
       if (dsc.armedChanged[partition]) dsc.armedChanged[partition] = false;  // Resets the partition armed status flag
 
       // Checks for changed status in additional partitions
       for (byte checkPartition = 0; checkPartition < dscPartitions; checkPartition++) {
-  
+
         // Skips processing if the partition is disabled, in installer programming, or not configured in the sketch
         if (dsc.disabled[checkPartition] || !configuredPartitions[checkPartition]) continue;
-  
+
         // Checks for changed status in a partition
         if (dsc.armedChanged[checkPartition] || dsc.exitDelayChanged[checkPartition] || dsc.alarmChanged[checkPartition]) {
           updatePartitions = true;
@@ -243,10 +243,10 @@ struct dscZone : Service::ContactSensor {
   void loop() {
     if (updateZones) {
       updateZones = false;
-      
+
       if (bitRead(dsc.openZonesChanged[zoneGroup], zoneBit)) {   // Checks an individual open zone status flag
         bitWrite(dsc.openZonesChanged[zoneGroup], zoneBit, 0);   // Resets the individual open zone status flag
-        
+
         if (bitRead(dsc.openZones[zoneGroup], zoneBit)) zoneState->setVal(1);  // Set zone status open
         else zoneState->setVal(0);  // Set zone status closed
       }
@@ -259,7 +259,7 @@ struct dscZone : Service::ContactSensor {
           }
         }
       }
-    } 
+    }
   }
 };
 
@@ -337,18 +337,18 @@ struct dscFire : Service::SmokeSensor {
   void loop() {
     if (updateSmokeSensors) {
       updateSmokeSensors = false;
-      
+
       dsc.fireChanged[partition] = false;  // Resets the fire status flag
 
       if (dsc.fire[partition]) fireState->setVal(1);  // Fire alarm tripped
       else fireState->setVal(0);  // Fire alarm restored
-      
+
       // Checks for changed status in additional partitions
       for (byte checkPartition = 0; checkPartition < dscPartitions; checkPartition++) {
-  
+
         // Skips processing if the partition is disabled, in installer programming, or not configured in the sketch
         if (dsc.disabled[checkPartition] || !configuredPartitions[checkPartition]) continue;
-  
+
         // Checks for changed fire status in a partition
         if (dsc.fireChanged[checkPartition]) updateSmokeSensors = true;
       }
@@ -374,7 +374,7 @@ struct dscPGM : Service::ContactSensor {
       updatePGMs = false;
 
       if (bitRead(dsc.pgmOutputsChanged[pgmGroup], pgmBit)) {
-        
+
         // Handles PGMs defined both as this contact sensor accessory and for a command switch output switch accessory
         if (bitRead(configuredCommandPGMs[pgmGroup], pgmBit)) {
 
@@ -384,11 +384,11 @@ struct dscPGM : Service::ContactSensor {
             bitWrite(dsc.pgmOutputsChanged[pgmGroup], pgmBit, 0);
           }
           else bitWrite(pendingPGMs[pgmGroup], pgmBit, 1);
-          
+
           if (bitRead(dsc.pgmOutputs[pgmGroup], pgmBit)) pgmState->setVal(1);  // Set PGM output status on
           else pgmState->setVal(0);  // Set PGM output status off
         }
-        
+
         // Handles PGMs defined only for this contact sensor accessory
         else {
           bitWrite(dsc.pgmOutputsChanged[pgmGroup], pgmBit, 0);
@@ -407,7 +407,7 @@ struct dscPGM : Service::ContactSensor {
           }
         }
       }
-    } 
+    }
   }
 };
 
@@ -447,7 +447,7 @@ struct dscCommand : Service::Switch {
     else if (targetState == 0 && bitRead(dsc.pgmOutputs[pgmGroup], pgmBit)) {
       cmdState->setVal(1);
     }
-    
+
     return(true);
   }
 
@@ -468,7 +468,7 @@ struct dscCommand : Service::Switch {
             bitWrite(dsc.pgmOutputsChanged[pgmGroup], pgmBit, 0);
           }
           else bitWrite(pendingPGMs[pgmGroup], pgmBit, 1);
-          
+
           if (bitRead(dsc.pgmOutputs[pgmGroup], pgmBit)) cmdState->setVal(1);  // Set command output status on
           else cmdState->setVal(0);  // Set command output status off
         }
@@ -491,7 +491,7 @@ struct dscCommand : Service::Switch {
           }
         }
       }
-    } 
+    }
   }
 };
 
@@ -501,7 +501,7 @@ struct homeSpanIdentify : Service::AccessoryInformation {
   homeSpanIdentify(const char *name, const char *manu, const char *sn, const char *model, const char *version) : Service::AccessoryInformation() {
     new Characteristic::Name(name);
     new Characteristic::Manufacturer(manu);
-    new Characteristic::SerialNumber(sn);    
+    new Characteristic::SerialNumber(sn);
     new Characteristic::Model(model);
     new Characteristic::FirmwareRevision(version);
     new Characteristic::Identify();

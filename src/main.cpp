@@ -1,54 +1,73 @@
 /*
  *  DSC-HomeKit-Ethernet
  *
- *  Adapted from dscKeybusInterface HomeKit-HomeSpan example for W5500 wired Ethernet.
+ *  Adapted from dscKeybusInterface HomeKit-HomeSpan example for wired Ethernet.
  *  Original: https://github.com/taligentx/dscKeybusInterface/tree/master/examples/esp32/HomeKit-HomeSpan
  *
- *  Changes from the original:
- *    - WiFi disabled at startup to free RAM
- *    - W5500 SPI Ethernet initialised via ETH.begin() before homeSpan.begin()
- *    - dscClockPin moved 18 → 32, dscReadPin moved 19 → 33 to vacate the
- *      default VSPI pins (SCK=18, MISO=19) used by the W5500
+ *  Target board: LilyGO T-Internet-POE (ESP32-WROOM-32E + onboard LAN8720A RMII PHY)
  *
- *  W5500 SPI wiring (ESP32 → W5500 module):
- *    GPIO 18 (SCK)  → W5500 SCLK
- *    GPIO 19 (MISO) → W5500 MISO
- *    GPIO 22 (MOSI) → W5500 MOSI
- *    GPIO  5 (CS)   → W5500 SCS
- *    GPIO  4 (INT)  → W5500 INT   (leave W5500_IRQ_PIN as -1 if not wired)
- *    GPIO  0 (RST)  → W5500 RESET — GPIO 0 is LOW in download mode, keeping W5500 in reset during upload
+ *  LAN8720A RMII — all connections are onboard, no external wiring needed:
+ *    PHY type:  LAN8720    PHY addr: 0
+ *    MDC:       GPIO 23    MDIO:     GPIO 18
+ *    ETH reset: GPIO  5    CLK out:  GPIO 17 (ETH_CLOCK_GPIO17_OUT)
+ *    RMII data: GPIO 19/21/22/25/26/27 (reserved by peripheral, do not use)
  *
  *  DSC Keybus wiring (see AI.md):
  *    GPIO 32 (CLK)   ← DSC Yellow via resistor divider
  *    GPIO 33 (READ)  ← DSC Green  via resistor divider
- *    GPIO 21 (WRITE) → NPN base via 1kΩ, collector to DSC Green
+ *    GPIO  4 (WRITE) → NPN base via 1kΩ, collector to DSC Green
+ *    (GPIO 21 is RMII TX_EN — moved write pin from 21 → 4)
  */
 
 // DSC Classic series: uncomment for PC1500/PC1550 support
 //#define dscClassicSeries
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <ETH.h>
 #include <time.h>
 #include "HomeSpan.h"
 #include <dscKeybusInterface.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 
 // Settings — access code lives in secrets.h (git-ignored)
 #include "secrets.h"
 
-// DSC Keybus pins  (18/19 are now used by W5500 SPI — moved to 32/33)
+static char gHomekitCode[16] = "46637726";
+
+// ── Log ring buffer ───────────────────────────────────────────────────────────
+#define LOG_LINES 48
+#define LOG_WIDTH 128
+
+static char              sLog[LOG_LINES][LOG_WIDTH];
+static uint32_t          sLogMs[LOG_LINES];
+static int               sLogHead  = 0;
+static int               sLogCount = 0;
+static SemaphoreHandle_t sLogMutex = nullptr;
+
+static void logLine(const char *fmt, ...) {
+  char tmp[LOG_WIDTH];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  Serial.print(tmp);
+  if (!sLogMutex) return;
+  xSemaphoreTake(sLogMutex, portMAX_DELAY);
+  sLogMs[sLogHead] = millis();
+  strlcpy(sLog[sLogHead], tmp, LOG_WIDTH);
+  sLogHead = (sLogHead + 1) % LOG_LINES;
+  if (sLogCount < LOG_LINES) sLogCount++;
+  xSemaphoreGive(sLogMutex);
+}
+
+// DSC Keybus pins
 #define dscClockPin  32  // 4,13,16-39
 #define dscReadPin   33  // 4,13,16-39
-#define dscPC16Pin   17  // DSC Classic Series only
-#define dscWritePin  21  // 4,13,16-33
-
-// W5500 SPI pins
-#define W5500_CS_PIN   5
-#define W5500_IRQ_PIN  4   // Set to -1 if INT pin not connected
-#define W5500_RST_PIN  0   // GPIO 0 = LOW during download mode → W5500 held in reset during upload
-#define W5500_SCK_PIN  18
-#define W5500_MISO_PIN 19
-#define W5500_MOSI_PIN 22
+#define dscPC16Pin   16  // DSC Classic Series only (GPIO17 reserved for ETH clock)
+#define dscWritePin   4  // was 21; GPIO21 is RMII TX_EN on T-Internet-POE
 
 // Initialize DSC interface
 #ifndef dscClassicSeries
@@ -70,25 +89,95 @@ unsigned long ntpLastLog = 0;
 
 #include "dscHomeSpanAccessories.h"
 
+static AsyncWebServer sWebServer(80);
+
+static void onEthEvent(arduino_event_id_t event, arduino_event_info_t) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      logLine("[ETH] Started\n");
+      ETH.setHostname("dsc");
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:    logLine("[ETH] Link up\n");          break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      logLine("[ETH] IP: %s\n", ETH.localIP().toString().c_str());
+      MDNS.addService("http", "tcp", 80);
+      break;
+    case ARDUINO_EVENT_ETH_LOST_IP:     logLine("[ETH] Lost IP\n");           break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:logLine("[ETH] Link down\n");         break;
+    case ARDUINO_EVENT_ETH_STOP:        logLine("[ETH] Stopped\n");           break;
+    default: break;
+  }
+}
+
+static void startWebServer() {
+  sWebServer.on("/api/log", HTTP_GET, [](AsyncWebServerRequest *req) {
+    String out = "[";
+    if (xSemaphoreTake(sLogMutex, pdMS_TO_TICKS(50))) {
+      int start = (sLogCount < LOG_LINES) ? 0 : sLogHead;
+      int cnt   = (sLogCount < LOG_LINES) ? sLogCount : LOG_LINES;
+      for (int i = 0; i < cnt; i++) {
+        int idx = (start + i) % LOG_LINES;
+        if (i) out += ',';
+        out += "{\"t\":";
+        out += sLogMs[idx];
+        out += ",\"msg\":\"";
+        for (const char *p = sLog[idx]; *p; p++) {
+          if      (*p == '"')  out += "\\\"";
+          else if (*p == '\\') out += "\\\\";
+          else if (*p == '\n') out += "\\n";
+          else if (*p != '\r') out += *p;
+        }
+        out += "\"}";
+      }
+      xSemaphoreGive(sLogMutex);
+    }
+    out += "]";
+    req->send(200, "application/json", out);
+  });
+
+  sWebServer.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest *req) {
+    req->send(200, "application/json", "{\"ok\":true,\"msg\":\"Rebooting\"}");
+    delay(500);
+    ESP.restart();
+  });
+
+  sWebServer.on("/api/homekit/reset", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Preferences prefs;
+    prefs.begin("HPAIR", false); prefs.clear(); prefs.end();
+    prefs.begin("HAP",   false); prefs.clear(); prefs.end();
+    req->send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"HomeKit pairing cleared — rebooting\"}");
+    delay(500);
+    ESP.restart();
+  });
+  sWebServer.onNotFound([](AsyncWebServerRequest *req) {
+    req->send(404, "application/json", "{\"ok\":false,\"error\":\"Not found\"}");
+  });
+  sWebServer.begin();
+}
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
+  sLogMutex = xSemaphoreCreateMutex();
 
-  // Disable WiFi to free RAM — we use wired Ethernet only
-  WiFi.mode(WIFI_OFF);
+  WiFi.onEvent(onEthEvent);
 
-  // Initialise W5500 via SPI; HomeSpan auto-detects ETH and switches to Ethernet mode
-  ETH.begin(ETH_PHY_W5500, /*phy_addr=*/1,
-            W5500_CS_PIN, W5500_IRQ_PIN, W5500_RST_PIN,
-            SPI3_HOST,
-            W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN);
+  // Initialise onboard LAN8720A via RMII; HomeSpan auto-detects ETH and switches to Ethernet mode
+  ETH.begin(ETH_PHY_LAN8720, /*phy_addr=*/0, /*mdc=*/23, /*mdio=*/18, /*rst=*/5, ETH_CLOCK_GPIO17_OUT);
+
 
   // Start SNTP — re-syncs automatically every hour; DHCP may not be up yet, SNTP retries
   configTzTime(timeZone, ntpServer);
 
-  homeSpan.begin(Category::Bridges, "DSC Security System");
+  homeSpan.setPortNum(8080);
+  homeSpan.enableOTA(false);
+  homeSpan.setPairingCode(gHomekitCode);
+  homeSpan.begin(Category::Bridges, "DSC Security System", "dsc");
+  homeSpan.setHostNameSuffix("");
+
+  startWebServer();
 
   // Bridge accessory identification
   new SpanAccessory();
@@ -255,8 +344,13 @@ void loop() {
   if (dsc.statusChanged) {
     dsc.statusChanged = false;
 
+    if (dsc.keybusChanged) {
+      dsc.keybusChanged = false;
+      logLine("[DSC] Keybus %s\n", dsc.keybusConnected ? "connected" : "disconnected");
+    }
+
     if (dsc.bufferOverflow) {
-      Serial.println(F("Keybus buffer overflow"));
+      logLine("[DSC] Keybus buffer overflow\n");
       dsc.bufferOverflow = false;
     }
 

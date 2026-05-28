@@ -5,7 +5,7 @@
       "label": "PlatformIO: Build",
       "type": "shell",
       "command": "${env:HOME}/.platformio/penv/bin/pio",
-      "args": ["run", "-e", "esp32dev"],
+      "args": ["run", "-e", "t_internet_poe"],
       "group": {
         "kind": "build",
         "isDefault": true
@@ -20,7 +20,7 @@
       "label": "PlatformIO: Upload",
       "type": "shell",
       "command": "${env:HOME}/.platformio/penv/bin/pio",
-      "args": ["run", "-e", "esp32dev", "-t", "upload", "--upload-port", "/dev/cu.usbserial-0001"],
+      "args": ["run", "-e", "t_internet_poe", "-t", "upload", "--upload-port", "/dev/cu.usbserial-0001"],
       "group": "build",
       "presentation": {
         "reveal": "always",

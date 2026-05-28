@@ -14,24 +14,20 @@ Integrate a DSC PC1832 PowerSeries alarm panel with Apple HomeKit and/or Google 
 
 | Component | Purpose |
 |-----------|---------|
-| ESP32 dev kit (HiLetgo) — CP2102 USB-serial chip (Silicon Labs) | Main microcontroller |
-| W5500 Ethernet module | Wired LAN (no WiFi) |
-| LM2596 buck converter | Steps 12V panel supply → 5V for ESP32 |
+| LilyGO T-Internet-POE (ESP32-WROOM-32E + LAN8720A) | Main microcontroller + onboard Ethernet + PoE |
+| LM2596 buck converter | Steps 12V panel supply → 5V (if not using PoE) |
 | 2N2222 or 2N3904 NPN transistor | Keybus write line driver |
 | 4.7kΩ resistors ×2 | Pull-ups on Keybus CLK and DATA lines |
 | 10kΩ resistor ×1 | Transistor base resistor |
-| Schottky diode (1N5817 or SS14) | Power rail protection (see Power section) |
 | Perfboard + project enclosure | Permanent mount |
+
+> No external W5500 module needed — Ethernet is onboard via LAN8720A RMII PHY.
 
 ## Power
 
-- Tapped from DSC panel 12V auxiliary supply
-- Stepped down via LM2596 on perfboard → 5V rail
-- Schottky diode (1N5817 or SS14) in series on the 5V rail: anode to LM2596 output, cathode to the shared 5V node (ESP32 VIN + W5500 VCC)
-  - Prevents USB back-feed into the LM2596 when USB is simultaneously connected (e.g. for serial monitoring)
-  - Both ESP32 and W5500 are powered from the cathode (protected) side
-- W5500 powered from 5V (its onboard regulator steps down to 3.3V internally), offloading the ESP32's onboard LDO
-- No external USB adapter needed
+Two options:
+1. **PoE** — power the T-Internet-POE directly from the network switch (IEEE 802.3af). Simplest wiring, no LM2596 needed.
+2. **Panel 12V** — tap DSC aux 12V supply → LM2596 buck converter → 5V into board VIN pin.
 
 ## Wiring: DSC Panel → ESP32 Box (4-wire bundle)
 
@@ -50,20 +46,19 @@ Integrate a DSC PC1832 PowerSeries alarm panel with Apple HomeKit and/or Google 
 |--------|------|-------|
 | Clock (CLK) | 32 | DSC Yellow wire via resistor divider |
 | Read (DATA in) | 33 | DSC Green wire via resistor divider |
-| Write (DATA out) | 21 | NPN base via 1kΩ, collector to DSC Green |
+| Write (DATA out) | 4 | NPN base via 1kΩ, collector to DSC Green |
 
-> GPIOs 18/19 are reserved for W5500 SPI (moved from the dscKeybusInterface defaults of 18/19).
+> GPIO 21 is reserved by the LAN8720 RMII peripheral (TX_EN) — write pin moved from 21 → 4.
 
-### W5500 Ethernet (SPI)
+### LAN8720A Ethernet (RMII — onboard, no wiring needed)
 
-| W5500 Signal | ESP32 GPIO | Notes |
-|---|---|---|
-| SCLK | 18 | Default VSPI SCK |
-| MISO | 19 | Default VSPI MISO |
-| MOSI | 22 | — |
-| SCS (CS) | 5 | Chip select |
-| INT | 4 | Set `W5500_IRQ_PIN -1` if not wired |
-| RESET | 0 | GPIO 0 is LOW in download mode → W5500 held in reset during upload |
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| MDC | 23 | Management clock |
+| MDIO | 18 | Management data |
+| ETH RESET | 5 | |
+| CLK out | 17 | 50 MHz ref clock to PHY (`ETH_CLOCK_GPIO17_OUT`) |
+| RMII data | 19, 21, 22, 25, 26, 27 | Reserved — do not use for other purposes |
 
 ## Physical Build
 
@@ -94,6 +89,30 @@ Active zones: 1–8, 10–13, 17–21. Zones 9, 14–16, and 22–32 are unused.
    - `Ethernet` (for W5500 / WIZnet)
 3. Flash adapted HomeKit-Ethernet sketch
 4. Pair via Apple Home app
+
+## Web API (ESPAsyncWebServer, port 80)
+
+```
+POST   /api/homekit/reset    → Clear HomeKit pairing data and reboot (sf=1 after reboot)
+```
+
+HAP server runs on port 8080 (`homeSpan.setPortNum(8080)`) to avoid conflict with the web server on port 80. Hostname is `dsc` (`dsc.local`).
+
+## OTA Updates
+
+First flash via the LilyGO downloader module plugged into the 6-pin programming header:
+
+```bash
+pio run -e t_internet_poe --target upload
+```
+
+After that, OTA is enabled. Update the IP in `platformio.ini` `[env:t_internet_poe_ota]` then:
+
+```bash
+pio run -e t_internet_poe_ota --target upload
+```
+
+HomeSpan OTA runs on the standard ArduinoOTA port (3232), no password.
 
 ## Code Conventions
 
