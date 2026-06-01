@@ -25,48 +25,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ETH.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include "HomeSpan.h"
 #include <dscKeybusInterface.h>
-#include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
-
-// Settings — access code lives in secrets.h (git-ignored)
 #include "secrets.h"
+#include "activity_log.h"
+#include "web_api.h"
 
 static char gHomekitCode[16] = "46637726";
 
-// ── Log ring buffer ───────────────────────────────────────────────────────────
-#define LOG_LINES 48
-#define LOG_WIDTH 128
-
-static char              sLog[LOG_LINES][LOG_WIDTH];
-static uint32_t          sLogMs[LOG_LINES];
-static int               sLogHead  = 0;
-static int               sLogCount = 0;
-static SemaphoreHandle_t sLogMutex = nullptr;
-
-static void logLine(const char *fmt, ...) {
-  char tmp[LOG_WIDTH];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(tmp, sizeof(tmp), fmt, ap);
-  va_end(ap);
-  Serial.print(tmp);
-  if (!sLogMutex) return;
-  xSemaphoreTake(sLogMutex, portMAX_DELAY);
-  sLogMs[sLogHead] = millis();
-  strlcpy(sLog[sLogHead], tmp, LOG_WIDTH);
-  sLogHead = (sLogHead + 1) % LOG_LINES;
-  if (sLogCount < LOG_LINES) sLogCount++;
-  xSemaphoreGive(sLogMutex);
-}
-
 // DSC Keybus pins
-#define dscClockPin  32  // 4,13,16-39
-#define dscReadPin   33  // 4,13,16-39
-#define dscPC16Pin   16  // DSC Classic Series only (GPIO17 reserved for ETH clock)
+#define dscClockPin  32
+#define dscReadPin   33
+#define dscPC16Pin   16  // DSC Classic Series only
 #define dscWritePin   4  // was 21; GPIO21 is RMII TX_EN on T-Internet-POE
 
 // Initialize DSC interface
@@ -80,95 +55,180 @@ bool updatePartitions, updateZones, updatePGMs, updateSmokeSensors;
 
 // NTP / time sync state
 const byte timePartition = 1;
-bool ntpSynced    = true;   // false = need to push time to panel
-bool ntpImmediate = false;  // true = panel clock was unset, push ASAP without offset trick
-byte ntpOffset    = 0;      // NTP second value at which to push (minimises sub-minute error)
+bool ntpSynced    = true;
+bool ntpImmediate = false;
+byte ntpOffset    = 0;
 tm   ntpTime;
-bool ntpReady     = false;  // true once SNTP has delivered a first timestamp
+bool ntpReady     = false;
 unsigned long ntpLastLog = 0;
+
+// WebSocket heartbeat
+static unsigned long sLastWsPushMs  = 0;
+static unsigned long sLastFlushMs   = 0;
+#define WS_PUSH_INTERVAL_MS   10000
+#define FLUSH_INTERVAL_MS     30000
+
+bool gLogMotion = false;  // log motion sensor zone events; set from panel.log_motion in config
+bool gBypassedZones[33] = {};  // index = zone number (1-based); toggled optimistically on bypass cmd
 
 #include "dscHomeSpanAccessories.h"
 
-static AsyncWebServer sWebServer(80);
+// ── Zone table (from ZONES.md) ────────────────────────────────────────────────
+struct ZoneInfo { uint8_t number; const char *name; const char *location; const char *type; };
+static const ZoneInfo kZones[] = {
+  {1,  "Porte Avant",        "RDC", "door"},
+  {2,  "Porte Arrière",      "SS",  "door"},
+  {3,  "Porte Patio",        "RDC", "door"},
+  {4,  "Porte Patio",        "2e",  "door"},
+  {5,  "Corridor",           "RDC", "motion"},
+  {6,  "Salle à manger",     "RDC", "motion"},
+  {7,  "Salon",              "RDC", "motion"},
+  {8,  "Bureau",             "2e",  "motion"},
+  {10, "Master Bathroom",    "2e",  "leak"},
+  {11, "Détecteur de fumée", "RDC", "smoke"},
+  {12, "Fenêtre Ouest",      "RDC", "window"},
+  {13, "Fenêtre Nord",       "RDC", "window"},
+  {17, "Salon",              "SS",  "motion"},
+  {18, "Fenêtre Atelier",    "SS",  "window"},
+  {19, "Fenêtre Sud",        "SS",  "window"},
+  {20, "Fenêtre Ouest",      "SS",  "window"},
+  {21, "Atelier",            "SS",  "motion"},
+};
+static const int kZoneCount = (int)(sizeof(kZones) / sizeof(kZones[0]));
+
+// ── Arm state helper ──────────────────────────────────────────────────────────
+static const char *armStateStr(byte partition) {
+  if (dsc.alarm[partition])     return "alarm";
+  if (dsc.entryDelay[partition])return "entry_delay";
+  if (dsc.armed[partition] && dsc.noEntryDelay[partition]) return "armed_night";
+  if (dsc.armed[partition] && dsc.armedAway[partition])    return "armed_away";
+  if (dsc.armed[partition] && dsc.armedStay[partition])    return "armed_stay";
+  if (dsc.exitDelay[partition]) {
+    if (dsc.exitState[partition] == DSC_EXIT_STAY)           return "exit_delay_stay";
+    if (dsc.exitState[partition] == DSC_EXIT_AWAY)           return "exit_delay_away";
+    if (dsc.exitState[partition] == DSC_EXIT_NO_ENTRY_DELAY) return "exit_delay_night";
+    return "exit_delay";
+  }
+  return "disarmed";
+}
+
+// ── buildStatusJson — called by web_api.cpp via forward declaration ───────────
+String buildStatusJson() {
+  JsonDocument resp;
+  resp["device"]     = "dsc";
+  resp["fw_version"] = "3.0";
+  resp["uptime_s"]   = (uint32_t)(millis() / 1000);
+  resp["connected"]  = dsc.keybusConnected;
+
+  time_t now = time(nullptr);
+  char ts[20];
+  if (now > 100000) {
+    struct tm ti; localtime_r(&now, &ti);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &ti);
+  } else {
+    strlcpy(ts, "1970-01-01T00:00:00", sizeof(ts));
+  }
+  resp["timestamp"] = ts;
+
+  JsonObject sum = resp["summary"].to<JsonObject>();
+  sum["keybus_connected"] = dsc.keybusConnected;
+  sum["arm_state"]        = armStateStr(0);
+  sum["trouble"]          = dsc.trouble;
+  sum["power_trouble"]    = dsc.powerTrouble;
+  sum["battery_trouble"]  = dsc.batteryTrouble;
+  sum["fire"]             = dsc.fire[0];
+
+  int zonesOpen = 0;
+  JsonArray zones = sum["zones"].to<JsonArray>();
+  for (int i = 0; i < kZoneCount; i++) {
+    uint8_t n = kZones[i].number;
+    bool open, alarm;
+    if (n == 11) {
+      open = alarm = dsc.fire[0];
+    } else {
+      int g = (n - 1) / 8, b = (n - 1) % 8;
+      open  = bitRead(dsc.openZones[g], b);
+      alarm = bitRead(dsc.alarmZones[g], b);
+    }
+    if (open) zonesOpen++;
+    JsonObject zobj = zones.add<JsonObject>();
+    zobj["number"]   = n;
+    zobj["name"]     = kZones[i].name;
+    zobj["location"] = kZones[i].location;
+    zobj["type"]     = kZones[i].type;
+    zobj["open"]     = open;
+    zobj["bypassed"] = (n < 33) ? gBypassedZones[n] : false;
+    zobj["alarm"]    = alarm;
+  }
+  sum["zones_open"] = zonesOpen;
+
+  String out;
+  serializeJson(resp, out);
+  return out;
+}
+
+// ── Zone change logger — call from statusChanged block, before updateZones ────
+static void logZoneChanges() {
+  for (int i = 0; i < kZoneCount; i++) {
+    uint8_t n = kZones[i].number;
+    if (n == 11) continue;
+    int g = (n - 1) / 8, b = (n - 1) % 8;
+    if (!bitRead(dsc.openZonesChanged[g], b)) continue;
+    if (!gLogMotion && strcmp(kZones[i].type, "motion") == 0) continue;
+    bool open = bitRead(dsc.openZones[g], b);
+    activityLog(open ? "warn" : "info", "keybus",
+                "%s (%s) %s", kZones[i].name, kZones[i].location,
+                open ? "opened" : "closed");
+  }
+}
+
+// ── Thin accessors for web_api.cpp (avoids re-including dscKeybusInterface.h) ─
+bool dscReady()     { return dsc.ready[0]; }
+bool dscArmed()     { return dsc.armed[0]; }
+bool dscExitDelay() { return dsc.exitDelay[0]; }
+bool dscAlarm()     { return dsc.alarm[0]; }
 
 static void onEthEvent(arduino_event_id_t event, arduino_event_info_t) {
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
-      logLine("[ETH] Started\n");
+      Serial.println("[ETH] Started");
       ETH.setHostname("dsc");
       break;
-    case ARDUINO_EVENT_ETH_CONNECTED:    logLine("[ETH] Link up\n");          break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("[ETH] Link up");
+      break;
     case ARDUINO_EVENT_ETH_GOT_IP:
-      logLine("[ETH] IP: %s\n", ETH.localIP().toString().c_str());
+      Serial.printf("[ETH] IP: %s\n", ETH.localIP().toString().c_str());
+      // HomeSpan has already called MDNS.begin() — just register the HTTP service.
       MDNS.addService("http", "tcp", 80);
       break;
-    case ARDUINO_EVENT_ETH_LOST_IP:     logLine("[ETH] Lost IP\n");           break;
-    case ARDUINO_EVENT_ETH_DISCONNECTED:logLine("[ETH] Link down\n");         break;
-    case ARDUINO_EVENT_ETH_STOP:        logLine("[ETH] Stopped\n");           break;
+    case ARDUINO_EVENT_ETH_LOST_IP:
+      Serial.println("[ETH] Lost IP");
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      Serial.println("[ETH] Link down");
+      break;
+    case ARDUINO_EVENT_ETH_STOP:
+      Serial.println("[ETH] Stopped");
+      break;
     default: break;
   }
-}
-
-static void startWebServer() {
-  sWebServer.on("/api/log", HTTP_GET, [](AsyncWebServerRequest *req) {
-    String out = "[";
-    if (xSemaphoreTake(sLogMutex, pdMS_TO_TICKS(50))) {
-      int start = (sLogCount < LOG_LINES) ? 0 : sLogHead;
-      int cnt   = (sLogCount < LOG_LINES) ? sLogCount : LOG_LINES;
-      for (int i = 0; i < cnt; i++) {
-        int idx = (start + i) % LOG_LINES;
-        if (i) out += ',';
-        out += "{\"t\":";
-        out += sLogMs[idx];
-        out += ",\"msg\":\"";
-        for (const char *p = sLog[idx]; *p; p++) {
-          if      (*p == '"')  out += "\\\"";
-          else if (*p == '\\') out += "\\\\";
-          else if (*p == '\n') out += "\\n";
-          else if (*p != '\r') out += *p;
-        }
-        out += "\"}";
-      }
-      xSemaphoreGive(sLogMutex);
-    }
-    out += "]";
-    req->send(200, "application/json", out);
-  });
-
-  sWebServer.on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest *req) {
-    req->send(200, "application/json", "{\"ok\":true,\"msg\":\"Rebooting\"}");
-    delay(500);
-    ESP.restart();
-  });
-
-  sWebServer.on("/api/homekit/reset", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Preferences prefs;
-    prefs.begin("HPAIR", false); prefs.clear(); prefs.end();
-    prefs.begin("HAP",   false); prefs.clear(); prefs.end();
-    req->send(200, "application/json",
-              "{\"ok\":true,\"msg\":\"HomeKit pairing cleared — rebooting\"}");
-    delay(500);
-    ESP.restart();
-  });
-  sWebServer.onNotFound([](AsyncWebServerRequest *req) {
-    req->send(404, "application/json", "{\"ok\":false,\"error\":\"Not found\"}");
-  });
-  sWebServer.begin();
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  sLogMutex = xSemaphoreCreateMutex();
+
+  if (!LittleFS.begin(true))
+    Serial.println("[FS] LittleFS mount failed");
+
+  activityInit();
 
   WiFi.onEvent(onEthEvent);
 
-  // Initialise onboard LAN8720A via RMII; HomeSpan auto-detects ETH and switches to Ethernet mode
   ETH.begin(ETH_PHY_LAN8720, /*phy_addr=*/0, /*mdc=*/23, /*mdio=*/18, /*rst=*/5, ETH_CLOCK_GPIO17_OUT);
 
-
-  // Start SNTP — re-syncs automatically every hour; DHCP may not be up yet, SNTP retries
   configTzTime(timeZone, ntpServer);
 
   homeSpan.setPortNum(8080);
@@ -177,7 +237,7 @@ void setup() {
   homeSpan.begin(Category::Bridges, "DSC Security System", "dsc");
   homeSpan.setHostNameSuffix("");
 
-  startWebServer();
+  setupWebServer();
 
   // Bridge accessory identification
   new SpanAccessory();
@@ -286,7 +346,7 @@ void setup() {
       strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
       Serial.printf("NTP time:   %s\n", buf);
     } else {
-      Serial.println("NTP time: not yet synced! Should be soon.");
+      Serial.println("NTP time: not yet synced!");
     }
     if (ntpReady)
       Serial.printf("Panel time: %04d-%02d-%02d %02d:%02d\n",
@@ -305,17 +365,21 @@ void setup() {
     ntpImmediate = true;
     Serial.println("NTP force sync: queued");
   });
+
+  activityLog("info", "system", "Boot complete — firmware v3.0");
+  activityFlush();
 }
 
 
 void loop() {
-  // Log NTP status once on first sync, then every 60 s (visible at log level >= 1)
+  // Log NTP status once on first sync, then every 60 s
   if (getLocalTime(&ntpTime)) {
     if (!ntpReady) {
       ntpReady = true;
       char buf[32];
       strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ntpTime);
       LOG1("NTP synced: %s\n", buf);
+      activityLog("info", "system", "NTP synced");
     } else if (millis() - ntpLastLog >= 60000) {
       ntpLastLog = millis();
       char buf[32];
@@ -334,6 +398,7 @@ void loop() {
         ntpSynced    = true;
         ntpImmediate = false;
         LOG1("Panel time synchronized\n");
+        activityLog("info", "system", "Panel time synchronized via NTP");
       }
     }
   }
@@ -341,16 +406,33 @@ void loop() {
   homeSpan.poll();
   dsc.loop();
 
+  // Consume any arm/disarm command queued by the HTTP handler — keep on main task.
+  // MUST be static: dsc.write(const char*) stores the pointer for async ISR use,
+  // so the buffer must outlive this loop() call.
+  static char pendingWrite[16];
+  if (webApiConsumePendingWrite(pendingWrite, sizeof(pendingWrite))) {
+    dsc.writePartition = 1;
+    if (pendingWrite[1] == '\0')
+      dsc.write(pendingWrite[0]);  // single-char commands: 's' (stay), 'w' (away)
+    else
+      dsc.write(pendingWrite);     // PIN string for disarm — pointer stays valid (static)
+  }
+
   if (dsc.statusChanged) {
     dsc.statusChanged = false;
 
     if (dsc.keybusChanged) {
       dsc.keybusChanged = false;
-      logLine("[DSC] Keybus %s\n", dsc.keybusConnected ? "connected" : "disconnected");
+      bool connected = dsc.keybusConnected;
+      Serial.printf("[DSC] Keybus %s\n", connected ? "connected" : "disconnected");
+      if (connected)
+        activityLog("info", "system", "Keybus connected");
+      else
+        activityLog("warn", "system", "Keybus disconnected");
     }
 
     if (dsc.bufferOverflow) {
-      logLine("[DSC] Keybus buffer overflow\n");
+      Serial.println("[DSC] Keybus buffer overflow");
       dsc.bufferOverflow = false;
     }
 
@@ -360,16 +442,37 @@ void loop() {
     }
 
     for (byte partition = 0; partition < dscPartitions; partition++) {
-      if (dsc.disabled[partition]) continue;
+      if (dsc.disabled[partition] || !configuredPartitions[partition]) continue;
 
       if (dsc.armedChanged[partition] || dsc.exitDelayChanged[partition] || dsc.alarmChanged[partition])
         updatePartitions = true;
 
-      if (dsc.fireChanged[partition])
+      if (dsc.armedChanged[partition]) {
+        const char *state =
+            dsc.alarm[partition]       ? "alarm"       :
+            dsc.entryDelay[partition]  ? "entry_delay" :
+            (dsc.armed[partition] && dsc.noEntryDelay[partition]) ? "armed_night" :
+            (dsc.armed[partition] && dsc.armedAway[partition])    ? "armed_away"  :
+            (dsc.armed[partition] && dsc.armedStay[partition])    ? "armed_stay"  :
+            dsc.exitDelay[partition]   ? "exit_delay"  : "disarmed";
+        activityLog("info", "keybus", "Partition %d → %s", partition + 1, state);
+      }
+
+      if (dsc.alarmChanged[partition] && dsc.alarm[partition]) {
+        activityLog("error", "keybus", "Alarm triggered on partition %d", partition + 1);
+      }
+
+      if (dsc.fireChanged[partition]) {
         updateSmokeSensors = true;
+        if (dsc.fire[partition])
+          activityLog("error", "keybus", "Fire alarm triggered");
+        else
+          activityLog("info", "keybus", "Fire alarm cleared");
+      }
     }
 
     if (dsc.openZonesStatusChanged) {
+      logZoneChanges();
       dsc.openZonesStatusChanged = false;
       updateZones = true;
     }
@@ -401,5 +504,21 @@ void loop() {
         }
       }
     }
+
+    wsPush();
+  }
+
+  unsigned long now = millis();
+
+  // WebSocket heartbeat every 10 s
+  if (now - sLastWsPushMs >= WS_PUSH_INTERVAL_MS) {
+    sLastWsPushMs = now;
+    wsPush();
+  }
+
+  // Periodic activity log flush every 30 s
+  if (now - sLastFlushMs >= FLUSH_INTERVAL_MS) {
+    sLastFlushMs = now;
+    activityFlush();
   }
 }

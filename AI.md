@@ -92,8 +92,20 @@ Active zones: 1–8, 10–13, 17–21. Zones 9, 14–16, and 22–32 are unused.
 
 ## Web API (ESPAsyncWebServer, port 80)
 
+See [DSC_ESP32.md](DSC_ESP32.md) for the full SPA-facing API spec.
+
+Implemented endpoints:
+
 ```
+GET    /api/status           → DSC status snapshot (arm state, zones, trouble)  [TO DO]
+GET    /api/config           → Notification rules config                         [TO DO]
+POST   /api/config           → Save notification rules                           [TO DO]
+GET    /api/activity?limit=N → Activity log, newest first                        [TO DO]
+ws://  /ws                   → WebSocket real-time push                          [TO DO]
+POST   /api/command          → Arm / disarm partition 1                          [TO DO]
+POST   /api/reboot           → Reboot the ESP32
 POST   /api/homekit/reset    → Clear HomeKit pairing data and reboot (sf=1 after reboot)
+GET    /api/log              → Internal debug ring buffer (not SPA-facing)
 ```
 
 HAP server runs on port 8080 (`homeSpan.setPortNum(8080)`) to avoid conflict with the web server on port 80. Hostname is `dsc` (`dsc.local`).

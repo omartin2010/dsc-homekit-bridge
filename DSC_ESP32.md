@@ -1,7 +1,7 @@
 # DSC PC1832 — ESP32 Firmware Spec
 
-**Board:** ESP32 with W5500 Ethernet module (perfboard assembly)
-**Protocol:** DSC Keybus (2-wire serial bus, 12 V signalling via level shifter)
+**Board:** LilyGO T-Internet-POE (ESP32-WROOM-32E + onboard LAN8720A RMII PHY + PoE)
+**Protocol:** DSC Keybus (2-wire serial bus, 12 V signalling via resistor dividers)
 **HomeKit bridge:** HomeSpan (partition as security system accessory)
 **Schema type:** `security`
 
@@ -60,7 +60,10 @@ The config for this device is notification rules only — not a schedule.
   "panel": {
     "auto_arm_away": false,
     "entry_delay_s": 30,
-    "exit_delay_s":  45
+    "exit_delay_s":  45,
+    "access_code":   "",
+    "log_motion":    false,
+    "chime_enabled": true
   }
 }
 ```
@@ -74,6 +77,16 @@ The config for this device is notification rules only — not a schedule.
 - `entry_delay_s` / `exit_delay_s`: informational only (reflects panel hardware
   DIP switch settings). Firmware does not control these — they are stored for
   SPA display purposes only.
+- `panel.access_code`: 4–8 digit string. When non-empty, used as the PIN for
+  `POST /api/command` validation **instead of** the hardcoded value in `secrets.h`.
+  Allows the SPA to configure the alarm code without reflashing.
+  Validation on POST: reject if non-empty and not 4–8 digits (HTTP 422).
+  Store in `/config.json`. Load on boot; fall back to `secrets.h` value if empty.
+- `panel.log_motion`: boolean (default `false`). When `false`, motion-sensor zone
+  open/close events are suppressed from the activity log. Toggled via Settings in SPA.
+- `panel.chime_enabled`: boolean (default `true`). Persists the SPA's view of whether
+  the panel entry chime is on. Updated by the SPA after a successful `chime_toggle`
+  command. Firmware stores it but does **not** re-apply it on boot (no read-back from panel).
 
 ---
 
@@ -81,27 +94,70 @@ The config for this device is notification rules only — not a schedule.
 
 ```json
 {
+  "device":     "dsc",
+  "fw_version": "3.0",
+  "uptime_s":   86400,
+  "connected":  true,
+  "timestamp":  "2025-11-15T07:42:00",
   "summary": {
-    "arm_state":   "disarmed",
-    "alarm_active": false,
-    "trouble":      false,
+    "keybus_connected": true,
+    "arm_state":        "disarmed",
+    "trouble":          false,
+    "power_trouble":    false,
+    "battery_trouble":  false,
+    "fire":             false,
+    "zones_open":       0,
     "zones": [
-      { "id": 1, "name": "Front door",    "open": false, "bypassed": false },
-      { "id": 2, "name": "Back door",     "open": false, "bypassed": false },
-      { "id": 3, "name": "Living motion", "open": false, "bypassed": false },
-      { "id": 4, "name": "Basement",      "open": false, "bypassed": false }
-    ],
-    "keybus_ok":    true,
-    "last_event":   "Disarmed by user — 07:42"
+      {
+        "number":   1,
+        "name":     "Porte Avant",
+        "location": "RDC",
+        "type":     "door",
+        "open":     false,
+        "bypassed": false,
+        "alarm":    false
+      }
+    ]
   }
 }
 ```
 
-### `arm_state` values
-`"disarmed"` | `"armed_stay"` | `"armed_away"` | `"arming"` | `"entry_delay"` | `"alarm"`
+Only configured zones are included (active zones: 1–8, 10–13, 17–21). See ZONES.md.
 
-`keybus_ok` is `false` if the Keybus connection has not received a valid
-message within the last 30 s.
+### `arm_state` values
+
+Derived from `dscKeybusInterface` partition 1 (index 0) fields.
+Priority when multiple flags are true: `alarm` > `entry_delay` > armed states > exit delays > `disarmed`.
+
+| Value                 | Condition                                                                      |
+|-----------------------|--------------------------------------------------------------------------------|
+| `"disarmed"`          | `!dsc.armed[0] && !dsc.exitDelay[0] && !dsc.alarm[0]`                         |
+| `"exit_delay_stay"`   | `dsc.exitDelay[0] && dsc.exitState[0] == DSC_EXIT_STAY`                        |
+| `"exit_delay_away"`   | `dsc.exitDelay[0] && dsc.exitState[0] == DSC_EXIT_AWAY`                        |
+| `"exit_delay_night"`  | `dsc.exitDelay[0] && dsc.exitState[0] == DSC_EXIT_NO_ENTRY_DELAY`              |
+| `"exit_delay"`        | `dsc.exitDelay[0]` (fallback when exitState doesn't match any known value)     |
+| `"armed_stay"`        | `dsc.armed[0] && dsc.armedStay[0] && !dsc.noEntryDelay[0]`                    |
+| `"armed_away"`        | `dsc.armed[0] && dsc.armedAway[0] && !dsc.noEntryDelay[0]`                    |
+| `"armed_night"`       | `dsc.armed[0] && dsc.noEntryDelay[0]`                                          |
+| `"entry_delay"`       | `dsc.entryDelay[0]`                                                            |
+| `"alarm"`             | `dsc.alarm[0]`                                                                 |
+
+### Zone fields
+
+| Field      | Source                                            | Notes                                       |
+|-----------|---------------------------------------------------|---------------------------------------------|
+| `number`   | Zone number (1-indexed)                           |                                             |
+| `name`     | Static — from ZONES.md                            |                                             |
+| `location` | Static — from ZONES.md (`RDC`, `2e`, `SS`)        |                                             |
+| `type`     | Static — `door`, `window`, `motion`, `leak`, `smoke` |                                          |
+| `open`     | `bitRead(dsc.openZones[(n-1)/8], (n-1)%8)`        | Zone 11: uses `dsc.fire[0]` instead         |
+| `bypassed` | `gBypassedZones[n]` — optimistic firmware flag     | Toggled by `bypass` command; resets on reboot; drifts if keypad is used directly |
+| `alarm`    | `bitRead(dsc.alarmZones[(n-1)/8], (n-1)%8)`       |                                             |
+
+**`bypassed` implementation:** `gBypassedZones[33]` (1-indexed) lives in RAM and is toggled
+optimistically when `POST /api/command bypass` is processed. The `dscKeybusInterface`
+library does not expose a `bypassedZones[]` read-back, so this state is best-effort and
+resets to all-false on firmware reboot.
 
 ---
 
@@ -116,26 +172,52 @@ POST /api/command
 { "cmd": "arm_away", "pin": "1234" }
 ```
 
-**`cmd` values:**
-- `"arm_away"` — full arm
-- `"arm_stay"` — perimeter arm
-- `"disarm"` — disarm (PIN required)
+**`cmd` values and Keybus writes:**
 
-**Response:**
+| `cmd`           | Keybus write             | Pre-condition                                                          |
+|-----------------|--------------------------|------------------------------------------------------------------------|
+| `arm_stay`      | `dsc.write('s')`         | `dsc.ready[0]` must be true                                            |
+| `arm_away`      | `dsc.write('w')`         | `dsc.ready[0]` must be true                                            |
+| `arm_night`     | `dsc.write('n')`         | `dsc.ready[0]` must be true (arm with no entry delay)                  |
+| `disarm`        | `dsc.write(pin)`         | `dsc.armed[0] \|\| dsc.exitDelay[0] \|\| dsc.alarm[0]`                |
+| `alarm_reset`   | `dsc.write('r')`         | none — clears alarm memory after a silenced alarm                      |
+| `chime_toggle`  | `dsc.write('c')`         | none — toggles the panel entry/exit chime; state is not read back      |
+| `bypass`        | `dsc.write("*1NN#")`     | `!dscArmed()` — NN is zero-padded zone number (e.g. `*105#` for zone 5) |
+
+The `bypass` command requires an additional `"zone"` field (integer 1–32):
 ```json
-{ "ok": true, "sent_at": "2025-11-15T08:01:00" }
+{ "cmd": "bypass", "zone": 5, "pin": "1234" }
+```
+Response includes the new bypass state:
+```json
+{ "ok": true, "bypassed": true }
+```
+Bypass toggles: sending the same command again un-bypasses the zone.
+
+Set `dsc.writePartition = 1` before each write.
+
+**Response (success, non-bypass commands):**
+```json
+{ "ok": true }
 ```
 
-The PIN is transmitted to the Keybus — firmware does not validate it locally.
-The panel accepts or rejects it. After sending, firmware waits up to 5 s for a
-state change on the bus and reports the resulting `arm_state` in the activity log.
+**Response (wrong PIN — mismatch against stored access code):**
+```json
+{ "ok": false, "error": "Unauthorized" }
+```
+HTTP 403. The firmware validates the PIN against the stored `accessCode` from `secrets.h`
+before issuing any Keybus write. The panel's own PIN check is a second layer.
 
-Log all arm/disarm commands with `source: "api"` regardless of outcome.
+**Response (panel not ready for arm):**
+```json
+{ "ok": false, "error": "Panel not ready" }
+```
+HTTP 422.
 
-> **Security note:** This endpoint is LAN-only and the panel enforces PIN
-> validation. Do not expose this endpoint outside the local network.
-> PIN is transmitted in plaintext over HTTP — acceptable for a trusted LAN,
-> but do not deploy this on an untrusted network.
+Log all commands with `source: "api"` regardless of outcome.
+
+> **Security note:** This endpoint is LAN-only. PIN is transmitted in plaintext
+> over HTTP — acceptable for a trusted LAN, but do not expose outside the local network.
 
 ---
 
@@ -218,18 +300,45 @@ Reference implementation:
   framing, message parsing, and command sending. Use this library rather
   than implementing the protocol from scratch.
 
-Key library calls used by this firmware:
+Key library fields used by this firmware:
+
 ```cpp
 dsc.loop();                    // call in main loop — parses incoming bus data
 dsc.statusChanged              // true when any panel state has changed
-dsc.partitionArmed[0]          // arm state for partition 1
-dsc.openZones[0]               // bitmask of open zones 1–8
-dsc.alarmZones[0]              // bitmask of zones in alarm
-dsc.write("*1");               // send keypad sequence (arm away example)
+dsc.keybusConnected            // true if Keybus data is being received
+dsc.armed[0]                   // partition 1 armed (any mode)
+dsc.armedAway[0]               // armed away
+dsc.armedStay[0]               // armed stay
+dsc.noEntryDelay[0]            // night arm (no entry delay)
+dsc.exitDelay[0]               // exit delay in progress
+dsc.exitState[0]               // DSC_EXIT_STAY / DSC_EXIT_AWAY / DSC_EXIT_NO_ENTRY_DELAY
+dsc.entryDelay[0]              // entry delay in progress
+dsc.alarm[0]                   // alarm triggered
+dsc.fire[0]                    // fire alarm triggered
+dsc.ready[0]                   // panel ready to arm
+dsc.trouble                    // general trouble
+dsc.powerTrouble               // AC power trouble
+dsc.batteryTrouble             // battery trouble
+dsc.openZones[group]           // bitmask: bit N = zone (group*8 + N + 1) is open
+dsc.alarmZones[group]          // bitmask: zones in alarm
+dsc.write('s');                // stay arm keypad key
+dsc.write('w');                // away arm keypad key
+dsc.write(accessCode);         // disarm
+dsc.writePartition = 1;        // target partition for next write
 ```
 
-Interrupt-driven clock input is required — attach CLK to an interrupt-capable
-GPIO (e.g. GPIO18) and configure the library accordingly.
+Zone group formula: `group = (zoneNumber - 1) / 8`, `bit = (zoneNumber - 1) % 8`.
+
+**Keypad write keys used by this firmware:**
+- `'s'` (0xAF) — stay arm
+- `'w'` (0xB1) — away arm
+- `'n'` (0xB6) — night arm (no entry delay)
+- `'r'` (0xDA) — alarm reset / clear alarm memory
+- `'c'` (0xBB) — door chime toggle
+- `"*1NN#"` string — zone bypass toggle (NN = zero-padded zone number)
+- PIN string — disarm
+
+**Not available from library:** read-back of bypassed zones; `gBypassedZones[]` is optimistic only.
 
 ---
 
@@ -257,46 +366,45 @@ Log HomeKit arm/disarm commands with `source: "homekit"`.
 
 ## Activity log sources for this device
 
-| `source`    | When written                                              |
-|------------|-----------------------------------------------------------|
-| `keybus`    | Zone open/close, arm state change, trouble, alarm event   |
-| `rule`      | Notification rule triggered                               |
-| `api`       | Arm/disarm command received via POST /api/command         |
-| `homekit`   | HomeKit arm/disarm command                                |
-| `system`    | Boot, NTP sync, Keybus connection lost/restored, OTA      |
+| `source`    | When written                                                                  |
+|------------|-------------------------------------------------------------------------------|
+| `keybus`    | Zone open/close, arm state change, trouble, alarm event                       |
+| `rule`      | Notification rule triggered                                                   |
+| `api`       | Any command received via POST /api/command (arm, disarm, bypass, chime, etc.) |
+| `homekit`   | HomeKit arm/disarm command                                                    |
+| `system`    | Boot, NTP sync, Keybus connection lost/restored, OTA                          |
+
+Activity log buffer: **200 entries** (`ACTIVITY_MAX_ENTRIES` in `activity_log.h`).
+The SPA fetches up to 100 entries (`/api/activity?limit=100`) for the History charts.
 
 ---
 
 ## PlatformIO `platformio.ini` starting point
 
-```ini
-[env:dsc]
-platform  = espressif32
-board     = esp32dev
-framework = arduino
-lib_deps  =
-    HomeSpan
-    ESPAsyncWebServer-esphome
-    ArduinoJson@^7
-    dscKeybusInterface
-monitor_speed = 115200
+See the project's `platformio.ini` for the actual build config.
+The two environments are `t_internet_poe` (USB flash) and `t_internet_poe_ota` (OTA upload).
+
+Key library dependencies:
+```
+HomeSpan
+ESPAsyncWebServer
+AsyncTCP
+ArduinoJson@^7
+dscKeybusInterface
 ```
 
 ---
 
 ## Hardware notes
 
-- **W5500 Ethernet module wiring (SPI):** MOSI=GPIO23, MISO=GPIO19, SCK=GPIO18,
-  CS=GPIO5 (adjust to your perfboard layout).
-- **Keybus level shifter:** The Keybus DATA line is 12 V. Use a voltage divider
-  (e.g. 22 kΩ / 10 kΩ) to bring it to 3.3 V for the ESP32 GPIO input.
-  The DSC CLK line is also 12 V — same treatment.
-- **Do not connect Keybus lines directly to ESP32 GPIO** — 12 V will destroy the GPIO.
-- **LM2596 buck converter:** Powers the ESP32 from the panel's 12 V aux supply.
-  Set output to 5 V, feed into ESP32 VIN. Confirm output voltage before
-  connecting to the board.
-- **Bench supply (Korad KA3005DE):** Use current limiting (< 500 mA) when
-  powering the assembly for the first time to protect against wiring errors.
-- The soldered perfboard assembly is more fragile than the Hunter enclosure.
-  Once validated on the bench, consider potting the perfboard or moving to
-  a proper PCB for long-term deployment.
+See `AI.md` for full wiring, pin assignments, and power supply details.
+
+The board is the **LilyGO T-Internet-POE** (ESP32-WROOM-32E + onboard LAN8720A RMII PHY).
+Ethernet is onboard — no W5500 SPI module. Use `ETH.begin()` with RMII parameters
+(see `main.cpp`) rather than the SPI Ethernet library.
+
+Key Keybus wiring:
+- CLK → GPIO 32 (via resistor divider: 12 V → 3.3 V)
+- DATA read → GPIO 33 (via resistor divider)
+- DATA write → GPIO 4 → NPN base (1 kΩ), collector to DSC DATA line
+- GPIO 21 is reserved for RMII TX_EN — do not use for Keybus write
