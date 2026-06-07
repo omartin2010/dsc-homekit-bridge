@@ -83,6 +83,7 @@ struct dscPartition : Service::SecuritySystem {
 
     // Resets the HomeKit target state if attempting to change the armed mode while not ready
     if (targetState != HOMEKIT_DISARM && !dsc.ready[partition]) {
+      partitionTargetState->setVal(HOMEKIT_DISARM);
       dsc.armedChanged[partition] = true;
       dsc.statusChanged = true;
       return(true);

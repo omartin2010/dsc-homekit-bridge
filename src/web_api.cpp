@@ -57,7 +57,7 @@ static void loadEffectivePin() {
 static String isoTs() {
   time_t now = time(nullptr);
   char buf[20];
-  if (now > 100000) {
+  if (now > 1577836800) {
     struct tm ti;
     localtime_r(&now, &ti);
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &ti);

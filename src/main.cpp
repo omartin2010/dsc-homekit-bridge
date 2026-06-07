@@ -33,6 +33,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include "secrets.h"
+#include <esp_system.h>
 #include "activity_log.h"
 #include "web_api.h"
 
@@ -366,7 +367,16 @@ void setup() {
     Serial.println("NTP force sync: queued");
   });
 
-  activityLog("info", "system", "Boot complete — firmware v3.0");
+  static const char *kResetReasons[] = {
+      "unknown","power-on","ext-rst","software","panic",
+      "int-wdt","task-wdt","wdt","deep-sleep","brownout","sdio"
+  };
+  esp_reset_reason_t rr = esp_reset_reason();
+  char bootMsg[64];
+  snprintf(bootMsg, sizeof(bootMsg), "Boot complete — firmware v3.0 (reset: %s)",
+           (unsigned)rr < sizeof(kResetReasons)/sizeof(*kResetReasons)
+           ? kResetReasons[rr] : "?");
+  activityLog("info", "system", bootMsg);
   activityFlush();
 }
 
